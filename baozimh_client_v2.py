@@ -52,6 +52,22 @@ def baozimh_watermark_bypass(img_url):
     return baozimh_universal_watermark_bypass(img_url)
 
 class BaozimhClient:
+    def download_multiple_chapters_generator(self, chapters: List[Dict[str, str]], comic_title: str, base_output_dir: str = "downloads") -> Generator[DownloadEvent, None, None]:
+        """
+        Download multiple chapters, ensuring each chapter's images go into its own folder.
+        Yields DownloadEvent with chapter context in the message.
+        """
+        safe_comic_title = "".join([c for c in comic_title if c.isalnum() or c in (' ', '-', '_')]).strip()
+        for chap in chapters:
+            chap_title = chap.get('title', 'Unknown Chapter')
+            safe_chap_title = "".join([c for c in chap_title if c.isalnum() or c in (' ', '-', '_')]).strip()
+            out_dir = os.path.join(base_output_dir, safe_comic_title, safe_chap_title)
+            yield DownloadEvent(type='message', message=f"Starting download for chapter: {chap_title}")
+            for event in self.download_chapter_generator(chap['url'], out_dir):
+                event.message = f"[{chap_title}] {event.message}"
+                yield event
+            yield DownloadEvent(type='message', message=f"Finished download for chapter: {chap_title}")
+
     BASE_URL = "https://www.baozimh.com"
     CDN_DOMAINS = [
         "https://s1.bzcdn.net",
@@ -573,23 +589,39 @@ if __name__ == "__main__":
                         print(f"{i+1}. {chap['title']}")
                 
                 print("\nOptions:")
-                print("- Enter a number to download a specific chapter")
+                print("- Enter a number to download a specific chapter (e.g. 5)")
+                print("- Enter a range to download multiple chapters (e.g. 1-10)")
                 print("- Enter 'custom' to manually input a chapter slot (generates page_direct URL)")
                 print("- Enter 'id' to manually input a Chapter ID (e.g. 96-9w0i)")
-                
-                chap_sel = input("Select option: ")
-                
+                print("- Enter 'all' to download ALL chapters (batch mode)")
+
+                chap_sel = input("Select option: ").strip()
+
                 target_chap = None
                 manual_id_mode = False
-                
-                if chap_sel.lower() == 'custom':
+
+                # Detect range input like "1-10"
+                range_match = re.fullmatch(r'(\d+)-(\d+)', chap_sel)
+                if range_match:
+                    range_start = int(range_match.group(1))
+                    range_end = int(range_match.group(2))
+                    if range_start < 1 or range_end > len(chapters) or range_start > range_end:
+                        print(f"Invalid range. Please enter a range between 1 and {len(chapters)}.")
+                    else:
+                        selected_chapters = chapters[range_start - 1:range_end]
+                        print(f"Batch downloading chapters {range_start} to {range_end} ({len(selected_chapters)} chapters)...")
+                        for event in client.download_multiple_chapters_generator(selected_chapters, comic['title']):
+                            print(event.message)
+                        print(f"\nBatch download finished! Check downloads/{comic['title']}/")
+                    exit(0)
+                elif chap_sel.lower() == 'custom':
                     slot_input = input("Enter chapter slot number (e.g. 0 for preview, 1 for ch.1): ")
                     try:
                         slot = int(slot_input)
                         # Extract comic_id from URL
                         path = urlparse(comic['url']).path
                         comic_id = path.split('/')[-1]
-                        
+
                         custom_url = f"{client.BASE_URL}/user/page_direct?comic_id={comic_id}&section_slot=0&chapter_slot={slot}"
                         target_chap = {
                             'title': f"Chapter Slot {slot}",
@@ -603,40 +635,43 @@ if __name__ == "__main__":
                          # Extract comic_id from URL
                         path = urlparse(comic['url']).path
                         comic_id = path.split('/')[-1]
-                        
+
                         target_chap = {
                             'title': f"Chapter ID {chapter_id}",
                             'url': f"manual:{comic_id}:{chapter_id}"
                         }
                         manual_id_mode = True
                 elif chap_sel.lower() == 'all':
-                     print("Batch download not implemented in CLI demo.")
+                    print("Batch downloading all chapters...")
+                    # Use the new batch download generator
+                    for event in client.download_multiple_chapters_generator(chapters, comic['title']):
+                        print(event.message)
+                    print(f"\nBatch download finished! Check downloads/{comic['title']}")
+                    exit(0)
                 else:
                     try:
                         idx = int(chap_sel) - 1
                         if 0 <= idx < len(chapters):
                             target_chap = chapters[idx]
                         else:
-                            print("Invalid selection range.")
+                            print("Invalid chapter selection.")
                     except ValueError:
                         print("Invalid input.")
-                
+
                 if target_chap:
                     safe_title = "".join([c for c in comic['title'] if c.isalnum() or c in (' ', '-', '_')]).strip()
                     safe_chap = "".join([c for c in target_chap['title'] if c.isalnum() or c in (' ', '-', '_')]).strip()
                     out_dir = os.path.join("downloads", safe_title, safe_chap)
-                    
+
                     print(f"Downloading {target_chap['title']} to {out_dir}...")
-                    
+
                     if manual_id_mode:
-                        # Parse manual info
                         _, cid, chid = target_chap['url'].split(':')
                         print("Starting brute-force download via CDN/API...")
                         for event in client.download_chapter_by_id_generator(cid, chid, out_dir):
-                            print(f"[{event.type}] {event.message}")
+                            print(event.message)
                     else:
-                        print("Starting download...")
                         for event in client.download_chapter_generator(target_chap['url'], out_dir):
-                            print(f"[{event.type}] {event.message}")
-                        
+                            print(event.message)
+
                     print(f"\nDownload finished! Check {out_dir}")
