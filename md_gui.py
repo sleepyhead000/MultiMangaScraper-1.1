@@ -46,9 +46,10 @@ except ImportError:
     selenium_available = False
     uc_available = False
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 from baozimh_client_v2 import BaozimhClient, DownloadEvent
+from download_utils import interruptible_sleep, atomic_write_bytes
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QLineEdit, QPushButton, QLabel, 
@@ -1392,7 +1393,7 @@ class ChapterWorker(QThread):
         self.captcha_response = None
         self.captcha_requested.emit(message)
         while self.captcha_response is None and self._is_running:
-            time.sleep(0.5)
+            interruptible_sleep(0.5, self._should_stop, step_seconds=0.1)
         return self.captcha_response
 
     def run(self):
@@ -1425,7 +1426,7 @@ class ChapterWorker(QThread):
 class DownloadWorker(QThread):
     progress = Signal(str)
     percent = Signal(int)
-    finished = Signal()
+    finished = Signal(dict)
     error = Signal(str)
     captcha_requested = Signal(str)
 
@@ -1444,6 +1445,13 @@ class DownloadWorker(QThread):
         self._selenium_driver = None
         self._newtoki_driver = None
         self.captcha_response = None
+        self.job_stats: Dict[str, Any] = {
+            "total": len(chapters),
+            "completed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "chapter_results": [],
+        }
         
         # PROPER seleniumbase import
         try:
@@ -1593,6 +1601,20 @@ class DownloadWorker(QThread):
                 self._newtoki_driver.quit()
             except:
                 pass
+
+    def _should_stop(self):
+        return (not self._is_running) or self.isInterruptionRequested()
+
+    def _record_chapter_result(self, chapter_label: str, status: str, detail: str = ""):
+        if status == "completed":
+            self.job_stats["completed"] += 1
+        elif status == "failed":
+            self.job_stats["failed"] += 1
+        else:
+            self.job_stats["skipped"] += 1
+        self.job_stats["chapter_results"].append(
+            {"chapter": chapter_label, "status": status, "detail": detail}
+        )
 
     def download_chapter_generic(self, chapter_url, title, output_dir, ch_num=None, i=0, total_chaps=1):
         """Your ORIGINAL - 50 images working"""
@@ -2133,9 +2155,11 @@ class DownloadWorker(QThread):
     def run(self):
         total_chaps = len(self.chapters)
         for i, chap in enumerate(self.chapters):
-            if not self._is_running: break
+            if self._should_stop():
+                break
             
             ch_num = chap.get("chapter") or "?"
+            chapter_label = f"Chapter {ch_num}"
             self.progress.emit(f"Processing Chapter {ch_num}...")
             
             try:
@@ -2145,28 +2169,35 @@ class DownloadWorker(QThread):
                     folder_name += f" - {safe_title}"
                 
                 out_path = Path(self.base_dir) / folder_name
+                chapter_ok = False
 
                 if self.site == "baozimh":
                     # Baozimh Industrial Download
                     series_url = self.manga_id # This contains the series URL for Baozimh
                     if self.download_chapter_baozimh_pro(chap, out_path, ch_num, i, total_chaps, series_url):
                         self._finalize_chapter(out_path, folder_name, chap)
+                        chapter_ok = True
+                    self._record_chapter_result(chapter_label, "completed" if chapter_ok else "failed")
                     continue
 
                 elif self.site == "happymh":
                     chapter_url = f"{HAPPYMH_BASE}{chap['id']}" if chap['id'].startswith("/") else chap['id']
                     if self.download_chapter_complete(chapter_url, out_path, ch_num, i, total_chaps, chap):
                         self._finalize_chapter(out_path, folder_name, chap)
+                        chapter_ok = True
+                    self._record_chapter_result(chapter_label, "completed" if chapter_ok else "failed")
                     continue
                 elif self.site == "newtoki":
                     # Inter-chapter human delay (CRITICAL for NewToki)
                     if i > 0:
                         delay = random.uniform(8.0, 15.0)
                         self.progress.emit(f"Human reading delay: {delay:.1f}s...")
-                        time.sleep(delay)
+                        interruptible_sleep(delay, self._should_stop, step_seconds=0.25)
                         
                     if self.download_chapter_newtoki(chap, out_path, ch_num, i, total_chaps):
                         self._finalize_chapter(out_path, folder_name, chap)
+                        chapter_ok = True
+                    self._record_chapter_result(chapter_label, "completed" if chapter_ok else "failed")
                     continue
                 else:
                     # MangaDex Download
@@ -2184,6 +2215,7 @@ class DownloadWorker(QThread):
 
                 if not urls:
                     self.progress.emit(f"No images for Ch {ch_num}")
+                    self._record_chapter_result(chapter_label, "failed", "No images")
                     continue
                 
                 if not out_path.exists():
@@ -2194,7 +2226,8 @@ class DownloadWorker(QThread):
 
                 total_imgs = len(urls)
                 for j, url in enumerate(urls, 1):
-                    if not self._is_running: break
+                    if self._should_stop():
+                        break
                     
                     # Apply Baozimh watermark bypass
                     url = self.baozimh_universal_watermark_bypass(url)
@@ -2235,9 +2268,9 @@ class DownloadWorker(QThread):
                             r = session.get(url, **get_kwargs)
                             try:
                                 r.raise_for_status()
-                                with open(dest, "wb") as f:
-                                    for chunk in r.iter_content(8192):
-                                        f.write(chunk)
+                                body = b"".join(r.iter_content(8192))
+                                if body:
+                                    atomic_write_bytes(dest, body)
                             finally:
                                 if hasattr(r, 'close'):
                                     r.close()
@@ -2257,13 +2290,18 @@ class DownloadWorker(QThread):
                 
                 # Common Metadata & CBZ
                 self._finalize_chapter(out_path, folder_name, chap)
+                self._record_chapter_result(chapter_label, "completed")
 
             except Exception as e:
                 self.error.emit(f"Error Ch {ch_num}: {e}")
+                self._record_chapter_result(chapter_label, "failed", str(e))
             
             self.percent.emit(int(((i + 1) / total_chaps) * 100))
-        
-        self.finished.emit()
+
+        if self._should_stop():
+            remaining = max(0, self.job_stats["total"] - len(self.job_stats["chapter_results"]))
+            self.job_stats["skipped"] += remaining
+        self.finished.emit(self.job_stats)
 
     def _finalize_chapter(self, out_path, folder_name, chap):
         # Common Metadata
@@ -2900,7 +2938,10 @@ class ModernMangaDexGUI(QMainWindow):
     def update_download_count(self):
         count = 0
         for i in range(self.chapter_tree.topLevelItemCount()):
-            if self.chapter_tree.topLevelItem(i).checkState(0) == Qt.Checked:
+            item = self.chapter_tree.topLevelItem(i)
+            if item.isHidden():
+                continue
+            if item.checkState(0) == Qt.Checked:
                 count += 1
         self.download_btn.setText(f"Download Selected ({count} chapters)")
         self.download_btn.setEnabled(count > 0)
@@ -2915,6 +2956,8 @@ class ModernMangaDexGUI(QMainWindow):
             count = 0
             for i in range(self.chapter_tree.topLevelItemCount()):
                 item = self.chapter_tree.topLevelItem(i)
+                if item.isHidden():
+                    continue
                 try:
                     chap_val = float(item.text(0))
                     if start_num <= chap_val <= end_num:
@@ -3043,15 +3086,23 @@ class ModernMangaDexGUI(QMainWindow):
 
     def select_all_chapters(self):
         for i in range(self.chapter_tree.topLevelItemCount()):
-            self.chapter_tree.topLevelItem(i).setCheckState(0, Qt.Checked)
+            item = self.chapter_tree.topLevelItem(i)
+            if item.isHidden():
+                continue
+            item.setCheckState(0, Qt.Checked)
 
     def deselect_all_chapters(self):
         for i in range(self.chapter_tree.topLevelItemCount()):
-            self.chapter_tree.topLevelItem(i).setCheckState(0, Qt.Unchecked)
+            item = self.chapter_tree.topLevelItem(i)
+            if item.isHidden():
+                continue
+            item.setCheckState(0, Qt.Unchecked)
 
     def invert_chapters(self):
         for i in range(self.chapter_tree.topLevelItemCount()):
             item = self.chapter_tree.topLevelItem(i)
+            if item.isHidden():
+                continue
             state = item.checkState(0)
             item.setCheckState(0, Qt.Unchecked if state == Qt.Checked else Qt.Checked)
 
@@ -3059,6 +3110,8 @@ class ModernMangaDexGUI(QMainWindow):
         selected_chapters = []
         for i in range(self.chapter_tree.topLevelItemCount()):
             item = self.chapter_tree.topLevelItem(i)
+            if item.isHidden():
+                continue
             if item.checkState(0) == Qt.Checked:
                 selected_chapters.append(item.data(0, Qt.UserRole))
         
@@ -3110,11 +3163,16 @@ class ModernMangaDexGUI(QMainWindow):
         self.download_worker.captcha_requested.connect(self.on_captcha_requested)
         self.download_worker.start()
 
-    def on_download_finished(self):
+    def on_download_finished(self, stats):
         self.download_btn.setEnabled(True)
         self.download_btn.reset()
-        self.log("Download complete!")
-        QMessageBox.information(self, "Success", "All selected chapters have been downloaded.")
+        completed = stats.get("completed", 0) if isinstance(stats, dict) else 0
+        failed = stats.get("failed", 0) if isinstance(stats, dict) else 0
+        skipped = stats.get("skipped", 0) if isinstance(stats, dict) else 0
+        total = stats.get("total", completed + failed + skipped) if isinstance(stats, dict) else 0
+        summary = f"Download finished. Completed: {completed}/{total}, Failed: {failed}, Skipped: {skipped}"
+        self.log(summary)
+        QMessageBox.information(self, "Download Summary", summary)
 
     def add_to_library(self):
         if not hasattr(self, 'selected_manga') or not self.selected_manga:
